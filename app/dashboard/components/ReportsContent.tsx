@@ -213,13 +213,13 @@ async function buildPDF(data: ReportData) {
     { label: 'Stock Cost of Goods', value: ph(data.totalStockCogs), sub: 'Cost to buy the stock items you sold' },
     { label: 'Menu vs Stock Split', value: `${menuShare}% / ${stockShare}%`, sub: 'Menu sales vs Stock product sales' },
   ]);
-
-  insightBox(
+insightBox(
     isProfitable
-      ? `Good news: Your business made a profit of ${ph(Math.abs(net))} this period. For every peso earned, you spent ${costRatio} centavos on expenses. Keep monitoring your costs to protect this margin.`
-      : `Heads up: Your expenses exceeded your sales by ${ph(Math.abs(net))} this period. Your costs were ${costRatio}% of revenue. Consider reducing manual expenses or increasing sales volume to return to profit.`,
+      ? `Good news: Your business made a profit of ${ph(Math.abs(net))} this period. For every peso earned, you spent ${costRatio} centavos on expenses.`
+      : `Heads up: Your expenses exceeded your sales by ${ph(Math.abs(net))} this period. Your costs were ${costRatio}% of revenue.`,
     isProfitable ? [22, 163, 74] : [220, 38, 38]
   );
+  
 
   divider();
 

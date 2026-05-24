@@ -78,7 +78,7 @@ function generateGroupInsight(group: Omit<OrderGroup, 'insight'>, type: 'menu' |
   const topCat  = group.categories[0];
   const margin  = group.totalRevenue > 0 ? ((group.totalRevenue - group.totalCogs) / group.totalRevenue * 100).toFixed(1) : '0.0';
   const topProd = topCat?.products.sort((a, b) => b.qty - a.qty)[0];
-  return `${topCat?.category ?? 'Top category'} led with ₱${topCat?.totalRevenue.toLocaleString('en-PH', { minimumFractionDigits: 2 })} revenue across ${topCat?.totalQuantity} units. Best item: ${topProd?.name ?? '—'} (${topProd?.qty ?? 0} sold). Gross margin: ${margin}%.`;
+  return `${topCat?.category ?? 'Top category'} led with ₱${topCat?.totalRevenue.toLocaleString('en-PH', { minimumFractionDigits: 2 })} revenue across ${topCat?.totalQuantity} units. Best item: ${topProd?.name ?? '—'} (${topProd?.qty ?? 0} sold).`;
 }
 
 function generateOverallInsight(data: Omit<ReportData, 'overallInsight'>): string {
