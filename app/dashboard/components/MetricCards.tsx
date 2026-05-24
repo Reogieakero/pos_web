@@ -1,3 +1,5 @@
+"use client";
+
 import React, { useEffect, useRef, useState } from 'react';
 import { ArrowUpRight, TrendingUp, Package, Sparkles, Plus, X, Loader2, Receipt, AlertTriangle, Pencil } from 'lucide-react';
 import { AreaChart, Area, ResponsiveContainer, XAxis } from 'recharts';
@@ -16,14 +18,15 @@ const areaData = [
   { name: '24', value: 50 },
 ];
 
-function AddCostOverlay({ 
-  onClose, 
-  onSaved, 
-  initialData 
-}: { 
-  onClose: () => void; 
+// ─── Overlay ──────────────────────────────────────────────────────────────────
+function AddCostOverlay({
+  onClose,
+  onSaved,
+  initialData,
+}: {
+  onClose: () => void;
   onSaved: (amount: number, label: string) => void;
-  initialData?: { id: string, amount: number, label: string };
+  initialData?: { id: string; amount: number; label: string };
 }) {
   const [amount, setAmount] = useState(initialData?.amount.toString() || "");
   const [label, setLabel] = useState(initialData?.label || "");
@@ -39,7 +42,6 @@ function AddCostOverlay({
     if (!label.trim()) { setError("Add a short description."); return; }
     setSaving(true);
     setError(null);
-
     if (initialData) {
       const { error: sbError } = await supabase
         .from("daily_costs")
@@ -54,7 +56,6 @@ function AddCostOverlay({
       });
       if (sbError) { setError(sbError.message); setSaving(false); return; }
     }
-
     onSaved(parsed, label.trim());
     onClose();
   }
@@ -119,6 +120,7 @@ function AddCostOverlay({
   );
 }
 
+// ─── Types ────────────────────────────────────────────────────────────────────
 interface TopProduct {
   product_name: string;
   product_category: string | null;
@@ -146,6 +148,14 @@ interface MetricCardsProps {
   viewMode: ViewMode;
 }
 
+interface CostRow {
+  id: string;
+  label: string;
+  amount: number;
+  source: 'manual' | 'stock';
+}
+
+// ─── Insight engine ───────────────────────────────────────────────────────────
 function computeInsight(products: ProductStat[], totalIncome: number, totalCost: number): Insight | null {
   if (products.length === 0) return null;
   const sorted = [...products].sort((a, b) => b.total_quantity - a.total_quantity);
@@ -176,11 +186,12 @@ function computeInsight(products: ProductStat[], totalIncome: number, totalCost:
   };
 }
 
+// ─── Main component ───────────────────────────────────────────────────────────
 export default function MetricCards({ selectedDate, viewMode }: MetricCardsProps) {
   const [showCostOverlay, setShowCostOverlay] = useState(false);
-  const [editingCost, setEditingCost] = useState<{id: string, amount: number, label: string} | undefined>();
+  const [editingCost, setEditingCost] = useState<{ id: string; amount: number; label: string } | undefined>();
   const [periodCost, setPeriodCost] = useState(0);
-  const [rawCosts, setRawCosts] = useState<any[]>([]);
+  const [costRows, setCostRows] = useState<CostRow[]>([]);
   const [periodIncome, setPeriodIncome] = useState(0);
   const [savedToast, setSavedToast] = useState<string | null>(null);
   const [topProduct, setTopProduct] = useState<TopProduct | null>(null);
@@ -189,58 +200,130 @@ export default function MetricCards({ selectedDate, viewMode }: MetricCardsProps
   const [allProducts, setAllProducts] = useState<ProductStat[]>([]);
   const [insight, setInsight] = useState<Insight | null>(null);
 
+  // ── Fetch income + costs (manual + auto stock COGS) ──────────────────────
   async function fetchIncomeAndCosts() {
     setIncomeLoading(true);
     const { start, end } = getDateRange(selectedDate, viewMode);
-    const [{ data: ordersData, error: ordersError }, { data: costsData, error: costsError }] = await Promise.all([
-      supabase.from("orders").select("total_price").gte("created_at", start.toISOString()).lte("created_at", end.toISOString()),
-      supabase.from("daily_costs").select("id, amount, label").gte("recorded_at", start.toISOString()).lte("recorded_at", end.toISOString()),
-    ]);
-    if (!ordersError) setPeriodIncome((ordersData ?? []).reduce((sum, row: any) => sum + Number(row.total_price), 0));
-    if (!costsError) {
-      setRawCosts(costsData ?? []);
-      setPeriodCost((costsData ?? []).reduce((sum, row: any) => sum + Number(row.amount), 0));
+
+    // Single query — pull everything needed for both income and COGS
+    const { data: ordersData, error: ordersError } = await supabase
+      .from("orders")
+      .select("product_id, product_name, product_type, unit_price, unit_cost, quantity, total_price")
+      .gte("created_at", start.toISOString())
+      .lte("created_at", end.toISOString());
+
+    if (ordersError || !ordersData) {
+      setPeriodIncome(0);
+      setCostRows([]);
+      setPeriodCost(0);
+      setIncomeLoading(false);
+      return;
     }
+
+    // ── Income ──────────────────────────────────────────────────────────────
+    // total_price on every order already stores unit_price * qty at time of sale,
+    // so we can sum it directly — no extra products fetch needed.
+    const income = ordersData.reduce(
+      (sum: number, r: any) => sum + Number(r.total_price),
+      0
+    );
+    setPeriodIncome(income);
+
+    // ── Manual costs ────────────────────────────────────────────────────────
+    const { data: costsData, error: costsError } = await supabase
+      .from("daily_costs")
+      .select("id, amount, label")
+      .gte("recorded_at", start.toISOString())
+      .lte("recorded_at", end.toISOString());
+
+    const manualRows: CostRow[] = !costsError && costsData
+      ? costsData.map((c: any) => ({
+          id: c.id,
+          label: c.label,
+          amount: Number(c.amount),
+          source: 'manual' as const,
+        }))
+      : [];
+
+    // ── Stock COGS — auto from unit_cost stored on each order ───────────────
+    // unit_cost is written at order-save time (= product.price at that moment),
+    // so no extra products lookup is needed, and historical costs stay accurate
+    // even if the product's cost price changes later.
+    const stockOrders = ordersData.filter((r: any) => r.product_type === 'stock');
+
+    // Group by product name so we show one pill per product, not one per order
+    const stockCogMap: Record<string, { qty: number; unitCost: number }> = {};
+    for (const r of stockOrders) {
+      const unitCost = Number(r.unit_cost ?? 0);
+      // Skip rows where cost wasn't recorded (old orders before the column existed)
+      if (unitCost <= 0) continue;
+      if (!stockCogMap[r.product_name]) {
+        stockCogMap[r.product_name] = { qty: 0, unitCost };
+      }
+      stockCogMap[r.product_name].qty += Number(r.quantity ?? 1);
+    }
+
+    const stockCostRows: CostRow[] = Object.entries(stockCogMap).map(
+      ([name, { qty, unitCost }]) => ({
+        id: `stock__${name}`,
+        label: `${name} (stock)`,
+        amount: parseFloat((unitCost * qty).toFixed(2)),
+        source: 'stock' as const,
+      })
+    );
+
+    const allRows = [...manualRows, ...stockCostRows];
+    setCostRows(allRows);
+    setPeriodCost(allRows.reduce((s, r) => s + r.amount, 0));
     setIncomeLoading(false);
   }
 
-  useEffect(() => {
-    fetchIncomeAndCosts();
-  }, [selectedDate, viewMode]);
+  // ── Fetch top product ────────────────────────────────────────────────────
+  async function fetchTopProduct() {
+    setTopLoading(true);
+    const { start, end } = getDateRange(selectedDate, viewMode);
 
-  useEffect(() => {
-    async function fetchTopProduct() {
-      setTopLoading(true);
-      const { start, end } = getDateRange(selectedDate, viewMode);
-      const { data, error } = await supabase
-        .from("orders")
-        .select("product_name, product_category, quantity, total_price")
-        .gte("created_at", start.toISOString())
-        .lte("created_at", end.toISOString());
-      if (error || !data || data.length === 0) {
-        setTopProduct(null);
-        setAllProducts([]);
-        setInsight(null);
-        setTopLoading(false);
-        return;
-      }
-      const totals: Record<string, ProductStat> = {};
-      for (const row of data) {
-        const key = row.product_name;
-        if (!totals[key]) totals[key] = { product_name: row.product_name, product_category: row.product_category ?? null, total_quantity: 0, total_revenue: 0 };
-        totals[key].total_quantity += Number(row.quantity);
-        totals[key].total_revenue += Number(row.total_price);
-      }
-      const sorted = Object.values(totals).sort((a, b) => b.total_quantity - a.total_quantity);
-      const top = sorted[0];
-      const grandTotal = sorted.reduce((sum, p) => sum + p.total_revenue, 0);
-      const revenue_pct = grandTotal > 0 ? Math.round((top.total_revenue / grandTotal) * 100) : 0;
-      setTopProduct({ ...top, revenue_pct });
-      setAllProducts(sorted);
+    const { data, error } = await supabase
+      .from("orders")
+      .select("product_id, product_name, product_category, product_type, quantity, total_price")
+      .gte("created_at", start.toISOString())
+      .lte("created_at", end.toISOString());
+
+    if (error || !data || data.length === 0) {
+      setTopProduct(null);
+      setAllProducts([]);
+      setInsight(null);
       setTopLoading(false);
+      return;
     }
-    fetchTopProduct();
-  }, [selectedDate, viewMode]);
+
+    // total_price already reflects the actual selling price at time of order
+    const totals: Record<string, ProductStat> = {};
+    for (const row of data) {
+      const key = row.product_name;
+      if (!totals[key]) {
+        totals[key] = {
+          product_name: row.product_name,
+          product_category: row.product_category ?? null,
+          total_quantity: 0,
+          total_revenue: 0,
+        };
+      }
+      totals[key].total_quantity += Number(row.quantity);
+      totals[key].total_revenue  += Number(row.total_price);
+    }
+
+    const sorted = Object.values(totals).sort((a, b) => b.total_quantity - a.total_quantity);
+    const top = sorted[0];
+    const grandTotal = sorted.reduce((sum, p) => sum + p.total_revenue, 0);
+    const revenue_pct = grandTotal > 0 ? Math.round((top.total_revenue / grandTotal) * 100) : 0;
+    setTopProduct({ ...top, revenue_pct });
+    setAllProducts(sorted);
+    setTopLoading(false);
+  }
+
+  useEffect(() => { fetchIncomeAndCosts(); }, [selectedDate, viewMode]);
+  useEffect(() => { fetchTopProduct(); },    [selectedDate, viewMode]);
 
   useEffect(() => {
     if (!topLoading && !incomeLoading) {
@@ -254,37 +337,49 @@ export default function MetricCards({ selectedDate, viewMode }: MetricCardsProps
     setTimeout(() => setSavedToast(null), 3000);
   }
 
-  const netValue = periodIncome - periodCost;
-  const isProfit = netValue >= 0;
-  const statusStyles = isProfit 
-    ? "border-emerald-500/30 shadow-[0_0_15px_-3px_rgba(16,185,129,0.1)]" 
+  // ── Derived display values ────────────────────────────────────────────────
+  const netValue    = periodIncome - periodCost;
+  const isProfit    = netValue >= 0;
+  const statusStyles = isProfit
+    ? "border-emerald-500/30 shadow-[0_0_15px_-3px_rgba(16,185,129,0.1)]"
     : "border-rose-500/30 shadow-[0_0_15px_-3px_rgba(244,63,94,0.1)]";
 
-  const costPct = periodIncome > 0 ? ((periodCost / periodIncome) * 100).toFixed(1) : "0.0";
+  const costPct     = periodIncome > 0 ? ((periodCost / periodIncome) * 100).toFixed(1) : "0.0";
   const periodLabel = viewMode === 'day' ? 'Today' : viewMode === 'week' ? 'This Week' : 'This Month';
+
   const insightColors = {
-    push: { badge: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20', icon: <TrendingUp className="h-3 w-3" />, bar: 'from-emerald-500/20' },
-    warning: { badge: 'bg-amber-500/10 text-amber-300 border-amber-500/20', icon: <AlertTriangle className="h-3 w-3" />, bar: 'from-amber-500/20' },
-    opportunity: { badge: 'bg-indigo-500/10 text-indigo-300 border-indigo-500/20', icon: <Sparkles className="h-3 w-3" />, bar: 'from-indigo-500/20' },
+    push:        { badge: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20', icon: <TrendingUp className="h-3 w-3" />,    bar: 'from-emerald-500/20' },
+    warning:     { badge: 'bg-amber-500/10 text-amber-300 border-amber-500/20',       icon: <AlertTriangle className="h-3 w-3" />, bar: 'from-amber-500/20'   },
+    opportunity: { badge: 'bg-indigo-500/10 text-indigo-300 border-indigo-500/20',    icon: <Sparkles className="h-3 w-3" />,      bar: 'from-indigo-500/20'  },
   };
   const colors = insight ? insightColors[insight.type] : insightColors.push;
 
+  const manualCostRows    = costRows.filter(r => r.source === 'manual');
+  const stockCostRowsDisp = costRows.filter(r => r.source === 'stock');
+  const stockCostTotal    = stockCostRowsDisp.reduce((s, r) => s + r.amount, 0);
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <section className="grid grid-cols-3 gap-6">
+
+      {/* ── Card 1: Performance ── */}
       <div className={`bg-[#0f1115] border rounded-3xl p-6 relative flex flex-col justify-between overflow-hidden group h-[260px] ${statusStyles}`}>
         <div className="absolute inset-0 bg-gradient-to-br from-blue-600/5 via-transparent to-transparent opacity-40" />
+
         {(showCostOverlay || editingCost) && (
-            <AddCostOverlay 
-                initialData={editingCost}
-                onClose={() => { setShowCostOverlay(false); setEditingCost(undefined); }} 
-                onSaved={handleCostSaved} 
-            />
+          <AddCostOverlay
+            initialData={editingCost}
+            onClose={() => { setShowCostOverlay(false); setEditingCost(undefined); }}
+            onSaved={handleCostSaved}
+          />
         )}
+
         {savedToast && (
           <div className="absolute bottom-4 left-4 right-4 z-30 bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-3 py-2 text-[10px] text-emerald-400 font-medium animate-in fade-in slide-in-from-bottom-1 duration-300">
             ✓ {savedToast}
           </div>
         )}
+
         <div className="z-10">
           <div className="flex justify-between items-start">
             <span className="text-sm font-medium text-slate-400">Performance · {periodLabel}</span>
@@ -292,7 +387,10 @@ export default function MetricCards({ selectedDate, viewMode }: MetricCardsProps
               <ArrowUpRight className="h-3.5 w-3.5 text-slate-400" />
             </button>
           </div>
+
           <div className="flex flex-col gap-4 mt-5">
+
+            {/* Income */}
             <div>
               <p className="text-[11px] text-slate-500 font-medium uppercase tracking-wider">Income</p>
               {incomeLoading ? (
@@ -310,6 +408,8 @@ export default function MetricCards({ selectedDate, viewMode }: MetricCardsProps
                 </div>
               )}
             </div>
+
+            {/* Cost */}
             <div className="border-t border-slate-800/60 pt-3">
               <div className="flex justify-between items-center">
                 <p className="text-[11px] text-slate-500 font-medium uppercase tracking-wider">Cost</p>
@@ -321,34 +421,75 @@ export default function MetricCards({ selectedDate, viewMode }: MetricCardsProps
                   Add Cost
                 </button>
               </div>
+
               {incomeLoading ? (
                 <div className="h-8 w-32 rounded-lg bg-slate-800/60 animate-pulse mt-1" />
               ) : (
-                <div className="flex flex-col gap-1 mt-1">
-                    <div className="flex items-baseline gap-2">
-                        <span className="text-2xl font-semibold text-rose-500 tracking-tight">
-                            ₱{periodCost.toLocaleString("en-PH", { minimumFractionDigits: 2 })}
-                        </span>
-                        <span className="text-[10px] text-slate-400 font-medium">{costPct}% of income</span>
+                <div className="flex flex-col gap-1.5 mt-1">
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-2xl font-semibold text-rose-500 tracking-tight">
+                      ₱{periodCost.toLocaleString("en-PH", { minimumFractionDigits: 2 })}
+                    </span>
+                    <span className="text-[10px] text-slate-400 font-medium">{costPct}% of income</span>
+                  </div>
+
+                  {/* Cost breakdown pills */}
+                  <div className="flex flex-wrap gap-1 mt-0.5">
+
+                    {/* Stock COGS — one aggregated pill showing the total, expandable per-product */}
+                    {stockCostTotal > 0 && (
+                      <div className="group/stock relative">
+                        <div className="flex items-center gap-1 px-1.5 py-0.5 bg-violet-500/10 border border-violet-500/20 rounded text-[9px] text-violet-300 font-medium select-none cursor-default">
+                          <Package className="h-2.5 w-2.5" />
+                          Stock COGS: ₱{stockCostTotal.toLocaleString("en-PH", { minimumFractionDigits: 2 })}
+                        </div>
+                        {/* Per-product breakdown on hover */}
+                        {stockCostRowsDisp.length > 1 && (
+                          <div className="absolute bottom-full left-0 mb-1.5 z-20 hidden group-hover/stock:flex flex-col gap-1 bg-[#0f1115] border border-violet-500/20 rounded-xl p-2 shadow-xl min-w-[160px]">
+                            <p className="text-[8px] text-violet-400 font-semibold uppercase tracking-widest mb-0.5">Per product</p>
+                            {stockCostRowsDisp.map(r => (
+                              <div key={r.id} className="flex justify-between gap-3 text-[9px]">
+                                <span className="text-slate-400 truncate max-w-[100px]">{r.label.replace(' (stock)', '')}</span>
+                                <span className="text-violet-300 font-semibold shrink-0">
+                                  ₱{r.amount.toLocaleString("en-PH", { minimumFractionDigits: 2 })}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Manual cost pills — click to edit */}
+                    {manualCostRows.map((c) => (
+                      <button
+                        key={c.id}
+                        onClick={() => setEditingCost({ id: c.id, amount: c.amount, label: c.label })}
+                        className="flex items-center gap-1 px-1.5 py-0.5 bg-slate-800/40 hover:bg-slate-800 rounded text-[9px] text-slate-400 border border-slate-700 transition-colors"
+                      >
+                        <Pencil className="h-2 w-2" />
+                        {c.label}: ₱{c.amount.toLocaleString("en-PH", { minimumFractionDigits: 2 })}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Net profit/loss line */}
+                  {(periodIncome > 0 || periodCost > 0) && (
+                    <div className={`flex items-center justify-between mt-1 pt-1.5 border-t border-slate-800/40`}>
+                      <span className="text-[9px] text-slate-600 font-semibold uppercase tracking-widest">Net</span>
+                      <span className={`text-[11px] font-bold ${isProfit ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {isProfit ? '+' : ''}₱{netValue.toLocaleString("en-PH", { minimumFractionDigits: 2 })}
+                      </span>
                     </div>
-                    <div className="flex flex-wrap gap-1 mt-1">
-                        {rawCosts.map((c) => (
-                            <button 
-                                key={c.id} 
-                                onClick={() => setEditingCost(c)}
-                                className="flex items-center gap-1 px-1.5 py-0.5 bg-slate-800/40 hover:bg-slate-800 rounded text-[9px] text-slate-400 border border-slate-700 transition-colors"
-                            >
-                                <Pencil className="h-2 w-2" />
-                                {c.label}: ₱{c.amount}
-                            </button>
-                        ))}
-                    </div>
+                  )}
                 </div>
               )}
             </div>
           </div>
         </div>
       </div>
+
+      {/* ── Card 2: Top Selling Item ── */}
       <div className="bg-[#0f1115] border border-slate-800/50 rounded-3xl p-6 flex flex-col h-[260px] relative overflow-hidden group">
         <div className="z-10 flex flex-col h-full">
           <div className="flex justify-between items-start">
@@ -406,6 +547,8 @@ export default function MetricCards({ selectedDate, viewMode }: MetricCardsProps
           </ResponsiveContainer>
         </div>
       </div>
+
+      {/* ── Card 3: Sales Insight ── */}
       <div className="bg-[#0f1115] border border-slate-800/50 rounded-3xl p-6 relative flex flex-col justify-between overflow-hidden group h-[260px]">
         <div className={`absolute inset-0 bg-gradient-to-br ${colors.bar} via-transparent to-transparent opacity-40`} />
         <div className="relative z-10 flex flex-col h-full gap-3">
@@ -451,6 +594,7 @@ export default function MetricCards({ selectedDate, viewMode }: MetricCardsProps
           </div>
         </div>
       </div>
+
     </section>
   );
 }

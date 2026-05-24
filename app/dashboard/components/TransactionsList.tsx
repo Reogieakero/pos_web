@@ -21,6 +21,9 @@ interface Order {
   source: "qr_scan" | "manual";
   created_at: string;
   synced_at: string | null;
+  product_type: "food" | "stock" | null;
+  unit_cost: number | null;
+  selling_price?: number | null;
 }
 
 interface TransactionsListProps {
@@ -39,8 +42,20 @@ function CategoryIcon({ category }: { category: string | null }) {
 
 function SourceBadge({ source }: { source: Order["source"] }) {
   return (
-    <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full tracking-wide uppercase ${source === "qr_scan" ? "bg-blue-500/10 text-blue-400 border border-blue-500/20" : "bg-slate-700/40 text-slate-500 border border-slate-700/40"}`}>
+    <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full tracking-wide uppercase ${
+      source === "qr_scan"
+        ? "bg-blue-500/10 text-blue-400 border border-blue-500/20"
+        : "bg-slate-700/40 text-slate-500 border border-slate-700/40"
+    }`}>
       {source === "qr_scan" ? "QR" : "Manual"}
+    </span>
+  );
+}
+
+function StockBadge() {
+  return (
+    <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full tracking-wide uppercase bg-violet-500/10 text-violet-400 border border-violet-500/20">
+      Stock
     </span>
   );
 }
@@ -52,8 +67,7 @@ function relativeTime(dateStr: string): string {
   if (mins < 60) return `${mins}m ago`;
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  return `${days}d ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
 }
 
 function SkeletonRow() {
@@ -87,17 +101,56 @@ export default function TransactionsList({ selectedDate, viewMode }: Transaction
 
     const { start, end } = getDateRange(selectedDate, viewMode);
 
-    const { data, error: sbError } = await supabase
+    const { data: ordersData, error: sbError } = await supabase
       .from("orders")
-      .select("id, product_id, product_name, product_category, unit_price, quantity, total_price, source, created_at, synced_at")
+      .select("id, product_id, product_name, product_category, unit_price, quantity, total_price, source, created_at, synced_at, product_type, unit_cost")
       .gte("created_at", start.toISOString())
       .lte("created_at", end.toISOString())
       .order("created_at", { ascending: false })
       .limit(30);
 
-    if (sbError) setError(sbError.message);
-    else setOrders((data as Order[]) ?? []);
+    if (sbError) {
+      setError(sbError.message);
+      setLoading(false);
+      setRefreshing(false);
+      return;
+    }
 
+    const rows = (ordersData ?? []) as Order[];
+
+    const stockProductIds = [
+      ...new Set(
+        rows
+          .filter(o => o.product_type === "stock")
+          .map(o => o.product_id)
+      ),
+    ];
+
+    const sellingPriceMap: Record<string, number> = {};
+
+    if (stockProductIds.length > 0) {
+      const { data: productData } = await supabase
+        .from("products")
+        .select("id, selling_price")
+        .in("id", stockProductIds);
+
+      if (productData) {
+        for (const p of productData) {
+          if (p.selling_price != null) {
+            sellingPriceMap[String(p.id)] = Number(p.selling_price);
+          }
+        }
+      }
+    }
+
+    const enriched = rows.map(o => ({
+      ...o,
+      selling_price: o.product_type === "stock"
+        ? (sellingPriceMap[String(o.product_id)] ?? null)
+        : null,
+    }));
+
+    setOrders(enriched);
     setLoading(false);
     setRefreshing(false);
   }
@@ -114,7 +167,7 @@ export default function TransactionsList({ selectedDate, viewMode }: Transaction
         const newOrder = payload.new as Order;
         const createdAt = new Date(newOrder.created_at);
         if (createdAt >= start && createdAt <= end) {
-          setOrders((prev) => [newOrder, ...prev].slice(0, 30));
+          fetchOrders();
         }
       })
       .subscribe();
@@ -122,10 +175,16 @@ export default function TransactionsList({ selectedDate, viewMode }: Transaction
     return () => { supabase.removeChannel(channel); };
   }, [selectedDate, viewMode]);
 
-  const totalRevenue = orders.reduce((sum, o) => sum + Number(o.total_price), 0);
-  const totalUnits = orders.reduce((sum, o) => sum + Number(o.quantity), 0);
+  const totalRevenue = orders.reduce((sum, o) => {
+    const isStock = o.product_type === "stock";
+    const total = isStock && o.selling_price != null
+      ? o.selling_price * Number(o.quantity)
+      : Number(o.total_price);
+    return sum + total;
+  }, 0);
 
-  const periodLabel = viewMode === 'day' ? 'Today' : viewMode === 'week' ? 'This Week' : 'This Month';
+  const totalUnits  = orders.reduce((sum, o) => sum + Number(o.quantity), 0);
+  const periodLabel = viewMode === "day" ? "Today" : viewMode === "week" ? "This Week" : "This Month";
 
   return (
     <div className="bg-[#0f1115] border border-slate-800/50 rounded-3xl p-6 flex flex-col gap-4 relative overflow-hidden h-[400px]">
@@ -155,7 +214,13 @@ export default function TransactionsList({ selectedDate, viewMode }: Transaction
         </button>
       </div>
 
-      <div className="flex flex-col gap-2.5 flex-1 overflow-y-auto pr-1.5 [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-slate-800/60 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-slate-700/80">
+      <div className="flex flex-col gap-2.5 flex-1 overflow-y-auto pr-1.5
+        [&::-webkit-scrollbar]:w-1
+        [&::-webkit-scrollbar-track]:bg-transparent
+        [&::-webkit-scrollbar-thumb]:bg-slate-800/60
+        [&::-webkit-scrollbar-thumb]:rounded-full
+        hover:[&::-webkit-scrollbar-thumb]:bg-slate-700/80">
+
         {loading && Array.from({ length: 5 }).map((_, i) => <SkeletonRow key={i} />)}
 
         {!loading && error && (
@@ -163,7 +228,9 @@ export default function TransactionsList({ selectedDate, viewMode }: Transaction
             <span className="text-2xl">⚠️</span>
             <p className="text-xs text-red-400 font-medium">Failed to load orders</p>
             <p className="text-[10px] text-slate-600 max-w-[180px]">{error}</p>
-            <button onClick={() => fetchOrders()} className="mt-1 text-[10px] text-blue-400 hover:text-blue-300 underline underline-offset-2">Try again</button>
+            <button onClick={() => fetchOrders()} className="mt-1 text-[10px] text-blue-400 hover:text-blue-300 underline underline-offset-2">
+              Try again
+            </button>
           </div>
         )}
 
@@ -175,36 +242,61 @@ export default function TransactionsList({ selectedDate, viewMode }: Transaction
           </div>
         )}
 
-        {!loading && !error && orders.map((order) => (
-          <div key={order.id} className="flex items-center justify-between p-2.5 rounded-xl bg-[#161920]/30 border border-slate-900/50 hover:bg-[#161920]/60 transition-colors group">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className="w-8 h-8 rounded-lg bg-black border border-slate-800 flex items-center justify-center shrink-0">
-                <CategoryIcon category={order.product_category} />
-              </div>
-              <div className="min-w-0">
-                <p className="text-xs font-medium text-white truncate leading-tight">{order.product_name}</p>
-                <div className="flex items-center gap-1.5 mt-0.5">
-                  <SourceBadge source={order.source} />
-                  {order.quantity > 1 && (
-                    <span className="text-[9px] text-slate-600">×{order.quantity}</span>
-                  )}
-                  {order.product_category && (
-                    <span className="text-[9px] text-slate-600 truncate">{order.product_category}</span>
-                  )}
+        {!loading && !error && orders.map((order) => {
+          const isStock = order.product_type === "stock";
+
+          const displayUnitPrice = isStock && order.selling_price != null
+            ? order.selling_price
+            : Number(order.unit_price);
+
+          const displayTotal = isStock && order.selling_price != null
+            ? order.selling_price * Number(order.quantity)
+            : Number(order.total_price);
+
+          return (
+            <div
+              key={order.id}
+              className={`flex items-center justify-between p-2.5 rounded-xl border transition-colors group
+                ${isStock
+                  ? "bg-violet-500/5 border-violet-900/40 hover:bg-violet-500/10"
+                  : "bg-[#161920]/30 border-slate-900/50 hover:bg-[#161920]/60"
+                }`}
+            >
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className={`w-8 h-8 rounded-lg border flex items-center justify-center shrink-0
+                  ${isStock ? "bg-violet-500/10 border-violet-800/40" : "bg-black border-slate-800"}`}>
+                  {isStock
+                    ? <Package className="h-3.5 w-3.5 text-violet-400" />
+                    : <CategoryIcon category={order.product_category} />
+                  }
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-white truncate leading-tight">{order.product_name}</p>
+                  <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                    <SourceBadge source={order.source} />
+                    {isStock && <StockBadge />}
+                    {order.quantity > 1 && (
+                      <span className="text-[9px] text-slate-600">×{order.quantity}</span>
+                    )}
+                    {order.product_category && (
+                      <span className="text-[9px] text-slate-600 truncate">{order.product_category}</span>
+                    )}
+                  </div>
                 </div>
               </div>
+
+              <div className="flex flex-col items-end shrink-0 ml-2">
+                <span className={`text-xs font-semibold ${isStock ? "text-violet-300" : "text-white"}`}>
+                  ₱{displayTotal.toLocaleString("en-PH", { minimumFractionDigits: 2 })}
+                </span>
+                <span className="text-[9px] text-slate-500 mt-0.5">
+                  ₱{displayUnitPrice.toLocaleString("en-PH", { minimumFractionDigits: 2 })} each
+                </span>
+                <span className="text-[9px] text-slate-600 mt-0.5">{relativeTime(order.created_at)}</span>
+              </div>
             </div>
-            <div className="flex flex-col items-end shrink-0 ml-2">
-              <span className="text-xs font-semibold text-white">
-                ₱{Number(order.total_price).toLocaleString("en-PH", { minimumFractionDigits: 2 })}
-              </span>
-              <span className="text-[9px] text-slate-500 mt-0.5">
-                ₱{Number(order.unit_price).toLocaleString("en-PH", { minimumFractionDigits: 2 })} each
-              </span>
-              <span className="text-[9px] text-slate-600 mt-0.5">{relativeTime(order.created_at)}</span>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
